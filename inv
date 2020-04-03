@@ -1,0 +1,14 @@
+#[foremanproxy]
+#foremanproxy0.bco.tym.cudaops.com  
+
+#[all:vars]
+#ansible_port=22
+#ansible_user=ashutau
+
+[decomm]
+workerd31.bbs.syd.cudaops.com real_ip=192.168.1.5
+workerd32.bbs.syd.cudaops.com real_ip=192.168.1.6
+workerd33.bbs.syd.cudaops.com real_ip=192.168.1.7
+
+
+#mospayportal_01 ansible_port=22 ansible_host=10.2.84.137 ansible_user=intervale real_host_name=mosp-prt01 real_ip=10.2.84.137

@@ -1,0 +1,36 @@
+---
+- name: Add DNS records
+  hosts: all
+  gather_facts: false
+  remote_user: ashutau
+  vars:
+    foremanproxy_host: foremanproxy0.bco.tym.cudaops.com
+    client_cert_path: /etc/puppetlabs/puppet/ssl/certs
+    client_key_path: /etc/puppetlabs/puppet/ssl/private_keys
+  tasks:
+    - name: Add A DNS records
+      uri:
+        url: https://{{ foremanproxy_host }}:8443/dns/
+        method: POST
+        body: "fqdn={{ inventory_hostname }}&value={{ real_ip }}&type=A"
+        client_cert: "{{ client_cert_path }}/{{ foremanproxy_host }}.pem"
+        client_key: "{{ client_key_path }}/{{ foremanproxy_host }}.pem"
+        validate_certs: no
+      delegate_to: "{{ foremanproxy_host }}"
+      become: true
+
+#    - debug: msg="{{ real_ip | ipaddr('revdns') }}"
+#    - debug: msg="{{ real_ip.split('.') | reverse | join('.') }}"
+
+#     - debug: msg="Reverse DNS for {{ real_ip }} is {{ lookup('dig', '{{ real_ip }}/PTR') }}"
+
+    - name: Add PTR DNS records
+      uri:
+        url: https://{{ foremanproxy_host }}:8443/dns/
+        method: POST
+        body: "fqdn={{ inventory_hostname }}&value={{ real_ip.split('.') | reverse | join('.') }}.in-addr.arpa&type=PTR"
+        client_cert: "{{ client_cert_path }}/{{ foremanproxy_host }}.pem"
+        client_key: "{{ client_key_path }}/{{ foremanproxy_host }}.pem"
+        validate_certs: no
+      delegate_to: "{{ foremanproxy_host }}"
+      become: true
