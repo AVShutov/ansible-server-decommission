@@ -1,0 +1,4 @@
+plugin: device42
+filters:
+  type: physical
+  service_level: Unknown

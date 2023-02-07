@@ -1,0 +1,5 @@
+plugin: device42
+filters:
+  tags_and:
+    - civ2
+  service_level: Decommissioned

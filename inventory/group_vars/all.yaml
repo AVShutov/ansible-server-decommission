@@ -1,0 +1,17 @@
+---
+service_user:          "puppet"
+service_pass: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          62346462653962633262646166663531396664326363303635323136656436623230346335393464
+          6665326563366666653730643138323634353663323432640a386432623862623463306337393163
+
+vault_my_user:         'user'
+vault_my_password: !vault |
+          $ANSIBLE_VAULT;1.1;AES256
+          38623139643032643865363030616330393262653166653966326262613265653133376439343565
+          3138626365646636353436343835366361633861366566350a306434383866653633393031656432
+
+ansible_user:              "{{ lookup('env','USERNAME') }}"
+ansible_password:          "{{ lookup('env','PASSWORD') }}"
+ansible_become_password:   "{{ lookup('env','PASSWORD') }}"
+ansible_ssh_password:      "{{ vault_my_password }}"
