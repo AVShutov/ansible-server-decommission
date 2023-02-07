@@ -1,0 +1,4 @@
+plugin: device42
+filters:
+  in_service: 'yes'
+  service_level: Production

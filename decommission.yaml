@@ -1,0 +1,840 @@
+---
+- name: build/decommission
+  gather_facts: no
+  hosts: all
+  force_handlers: True
+  vars:
+####puppet vars####
+    puppet_adm_host:         puppet.adm.example.com
+    puppet_revoke_host_civ1: puppet.revoke.example.net
+    puppet_revoke_host_civ2: puppet0.example.com
+####dns vars####
+    foremanproxy_host:       foremanproxy0.example.com
+    client_cert_path:        /etc/puppetlabs/puppet/ssl/certs
+    client_key_path:         /etc/puppetlabs/puppet/ssl/private_keys
+    dns_resolver:            dns.example.com
+####d42 vars####
+    d42_hostname:            'device42.example.com'
+    d42_url:                 "https://{{ d42_hostname }}/api/1.0"
+    d42_service_user:        "{{ lookup('env','D42_USERNAME') }}"
+    d42_service_user_pwd:    "{{ lookup('env','D42_PASSWORD') }}"
+    d42_device_present:      'FALSE'
+####git vars####
+    git_url:                 'ssh://git@stash.example.com:7999/pup/control.git'
+    git_branch:              "{{ jira_issue | d('Issue') }}-automatic-decomm"
+    git_msg:                 "{{ jira_issue | d('Issue') }} Remove decommissioned host files. Automatic decomm"
+    git_remove_local:        true
+    git_username:            'Decommission'
+    git_email:               'decommission@example.com'
+    repo_file_exists:        false
+####monitoring vars####
+#    sensu_host:              sensu.example.com
+    sensu_host:              "{{ foremanproxy_host }}"
+####jira vars####
+    jira_url:               "https://bugs.example.com"
+#    jira_user:              "{{ vault_my_user }}"
+    jira_user:              "{{ lookup('env','JIRA_USERNAME') }}"
+    jira_pass:              "{{ lookup('env','JIRA_PASSWORD') }}"
+    jira_add:                true
+####check vars####
+    decomm_failed:           true
+    device_needs_remove:     false
+    shutdown_result:        'Host not pinged'
+
+  tasks:
+
+############################################################
+# Part 0. Find Jira issue and filter hosts inventory
+############################################################
+    - name: Find issue / Jira
+      uri:
+        url: "{{ jira_url }}/rest/api/latest/search?jql=project='Cloud+Operations+SD'+\
+              AND+issuetype='Decommission'+\
+              AND+status='Ready+for+Decomm'+\
+              AND+summary~'{{ inventory_hostname | regex_replace('.example.com') }}*'&key&fields=customfield_15918"
+        method: GET
+        user: "{{ jira_user }}"
+        password: "{{ jira_pass }}"
+        force_basic_auth: yes
+      register: jira_find_result
+      delegate_to: localhost
+
+    - name: Set Jira issue key
+      set_fact:
+        jira_issue: "{{ jira_find_result.json.issues[0].key }}"
+
+    - debug:
+        msg: "{{ jira_find_result.json.total }}"
+
+    - name: End the play for hosts that not found/filtered in Jira
+      meta: end_host
+      when:
+      - jira_find_result.json.total == 0
+
+    - debug:
+        msg: "Continue with {{ inventory_hostname }} and {{ jira_issue }}"
+
+    - name: Set FQDN device name
+      set_fact:
+        device_hostname: "{{ inventory_hostname | regex_replace('.example.com') +'.example.com' }}"
+
+    - name: Create report with handlers
+      command: echo "Create decommission report"
+      delegate_to: localhost
+      run_once: true
+      notify:
+        - Play report
+        - Jira report
+
+    - name: Decom in Progress issue status
+      jira:
+        uri: '{{ jira_url }}'
+        username: '{{ jira_user }}'
+        password: '{{ jira_pass }}'
+        issue: '{{ jira_issue }}'
+        operation: transition
+        status: Decom In Progress
+      ignore_errors: true
+      delegate_to: localhost
+      when:
+        - jira_add
+        - jira_issue is defined
+############################################################
+# Part I. Shutdown host
+############################################################
+    - name: Check if {{ device_hostname }} is pingable
+      command: ping -c 2 {{ device_hostname }}
+      register: ping_result
+      ignore_errors: yes
+      delegate_to: localhost
+
+    - name: Shutdown {{ device_hostname }}
+      command: shutdown -h now
+      register: shutdown_output
+      become: true
+      ignore_unreachable: true
+      delegate_to: "{{ device_hostname }}"
+      when: ping_result is succeeded
+
+    - name: Set shutdown result
+      set_fact:
+        shutdown_result: "{{ shutdown_output.stdout | d(shutdown_output.msg) | d('Host not pingable and unreachable') }}"
+
+    - debug:
+        msg: "{{ shutdown_result }}"
+
+############################################################
+# Part II. Remove Puppet Config
+############################################################
+    - name: Revoke Puppet Cert from {{ puppet_revoke_host_civ1 }}
+      command: /usr/local/sbin/puppet-revoke.sh {{ device_hostname }}
+      delegate_to: "{{ puppet_revoke_host_civ1 }}"
+      register: revoke_pup_cert_result
+      become: true
+      remote_user: "{{ lookup('env','USERNAME') }}"
+      ignore_errors: true
+      ignore_unreachable: true
+      tags: rm_puppet, full
+
+    - name: Remove from PuppetDB / {{ puppet_adm_host }}
+      command: ruby /home/user1/puppetstoredconfigclean.rb-2.7.10 {{ device_hostname }}
+      delegate_to: "{{ puppet_adm_host }}"
+      register: remove_pup_conf_result
+      become: true
+      remote_user: "{{ lookup('env','USERNAME') }}"
+      ignore_errors: true
+      ignore_unreachable: true
+      tags: rm_puppet, full
+
+    - debug:
+        msg:
+          - "{{ revoke_pup_cert_result.stdout_lines }}"
+          - "=================================="
+          - "{{ remove_pup_conf_result.stdout_lines }}"
+############################################################
+# Part III. Remove DNS records
+############################################################
+    - name: Resolve ip
+      shell: "ip=$(dig +short {{ inventory_hostname }} @{{ dns_resolver }}); [ -z $ip ] && echo 'Not found' || echo $ip"
+      register: resolve_result
+      ignore_errors: true
+      ignore_unreachable: true
+      delegate_to: "{{ foremanproxy_host }}"
+
+    - name: Set resolved ip
+      set_fact:
+        resolved_ip: "{{ resolve_result.stdout | d('Not found') }}"
+        cacheable: yes
+
+    - name: Remove DNS records / Foreman API
+      block:
+
+      - name: Remove A DNS records
+        uri:
+          url: https://{{ foremanproxy_host }}:8443/dns/{{ device_hostname }}
+          method: DELETE
+          client_cert: "{{ client_cert_path }}/{{ foremanproxy_host }}.pem"
+          client_key: "{{ client_key_path }}/{{ foremanproxy_host }}.pem"
+          validate_certs: no
+        register: rm_a_dns_result
+        when: resolved_ip != 'Not found'
+
+      - name: Remove PTR DNS records
+        uri:
+          url: https://{{ foremanproxy_host }}:8443/dns/{{ resolved_ip.split('.') | reverse | join('.') }}.in-addr.arpa
+          method: DELETE
+          client_cert: "{{ client_cert_path }}/{{ foremanproxy_host }}.pem"
+          client_key: "{{ client_key_path }}/{{ foremanproxy_host }}.pem"
+          validate_certs: no
+        register: rm_ptr_dns_result
+        when: resolved_ip != 'Not found'
+
+      delegate_to: "{{ foremanproxy_host }}"
+      become: true
+      tags: rm_dns, full
+
+    - debug:
+        msg:
+          - "{{ resolved_ip }}"
+          - "=================================="
+          - "{{ rm_a_dns_result.url | default(None) }}"
+          - "=================================="
+          - "{{ rm_ptr_dns_result.url | default(None) }}"
+############################################################
+# Part IV. Reclaim/Remove IP Space
+############################################################
+# - You need to install "jmespath" prior to running json_query filter (> pip3 install jmespath)
+# - The device name in d42 may be full (cloudscan.rzc.example.com), short (cloudscan.rzc), or the device may be absent
+############################################################
+    - name: Check device name (fqdn or not) / Device42
+      uri:
+        url: "{{ d42_url }}/devices/name/{{ device_hostname }}/"
+        method: GET
+        user: "{{ d42_service_user }}"
+        password: "{{ d42_service_user_pwd }}"
+        force_basic_auth: yes
+        return_content: yes
+      delegate_to: localhost
+      register: device_name_result
+      failed_when: false
+
+    - debug: msg="{{device_name_result.msg}}"
+
+    - name: Set device name in Device42
+      set_fact:
+        d42_device_name: "{{ device_hostname if ('OK' in device_name_result.msg) else device_hostname | regex_replace('.example.com') }}"
+
+    - debug: msg="{{d42_device_name}}"
+
+    - name: Check if device is present in Device42
+      uri:
+        url: "{{ d42_url }}/devices/name/{{ d42_device_name }}/"
+        method: GET
+        user: "{{ d42_service_user }}"
+        password: "{{ d42_service_user_pwd }}"
+        force_basic_auth: yes
+        return_content: yes
+      delegate_to: localhost
+      register: device_present_result
+      failed_when: false
+
+    - name: Set device present msg
+      set_fact:
+        d42_device_present: "{{ device_present_result.msg }}"
+
+    - debug: msg="{{device_present_result.msg}}"
+
+    - block:
+
+      - name: Get host bound ips / Device42
+        uri:
+          url: "{{ d42_url }}/devices/name/{{ d42_device_name }}/?include_cols=ip_addresses"
+          method: GET
+          user: "{{ d42_service_user }}"
+          password: "{{ d42_service_user_pwd }}"
+          force_basic_auth: yes
+          return_content: yes
+        delegate_to: localhost
+        register: host_ips
+        ignore_errors: true
+        tags: rm_ip, full
+
+      - name: Set host ips to release / Device42
+        set_fact:
+          host_release_ips: "{{ host_ips | json_query('json.ip_addresses[?label!=`ipmi` && label!=`IPMI`].ip') }}"
+          cacheable: yes
+        tags: rm_ip, full
+
+      - name: Release device ips / Device42
+        uri:
+          url: "{{ d42_url }}/ips/"
+          method: POST
+          body: "ipaddress={{ item }}&available=yes&clear_all=yes"
+          user: "{{ d42_service_user }}"
+          password: "{{ d42_service_user_pwd }}"
+          force_basic_auth: yes
+          return_content: yes
+        register: release_ips_result
+        with_items: "{{ host_release_ips }}"
+        ignore_errors: yes
+        delegate_to: localhost
+        tags: rm_ip, full
+
+      - debug:
+          msg:
+            - "{{ release_ips_result | json_query('results[*].json.msg') }}"
+
+      when: "'OK' in d42_device_present"
+############################################################
+# Part V. Puppet Cleanup
+############################################################
+    - name: Parse FQDN / when host.region.example.com
+      block:
+      - name: Set decomm host info / when host.region.example.com
+        set_fact:
+          host_short: "{{ device_hostname.split('.')[:-2][0]}}"
+          host_region: "{{ device_hostname.split('.')[:-2][1]}}"
+      - name: Set decomm host repo file / when host.region.example.com
+        set_fact:
+          host_repo_file: "/data/node/{{ host_region }}/{{ host_short }}.yaml"
+      when: device_hostname.split('.')[:-2]|length == 2
+      tags: rm_puppet, full
+
+    - name: Parse FQDN / when host.product.region.example.com
+      block:
+      - name: Set decomm host info / when host.product.region.example.com
+        set_fact:
+          host_short: "{{ device_hostname.split('.')[:-2][0]}}"
+          host_product: "{{ device_hostname.split('.')[:-2][1] }}"
+          host_region: "{{ device_hostname.split('.')[:-2][2]}}"
+      - name: Set decomm host repo file / when host.product.region.example.com
+        set_fact:
+          host_repo_file: "/data/node/{{ host_product }}/{{ host_region }}/{{ host_short }}.yaml"
+      when: device_hostname.split('.')[:-2]|length == 3
+      tags: rm_puppet, full
+
+    - name: Parse FQDN / when host.cluster.product.region.example.com
+      block:
+      - name: Set decomm host info / when host.cluster.product.region.example.com
+        set_fact:
+          host_short: "{{ device_hostname.split('.')[:-2][0]}}"
+          host_cluster: "{{ device_hostname.split('.')[:-2][1] }}"
+          host_product: "{{ device_hostname.split('.')[:-2][2] }}"
+          host_region: "{{ device_hostname.split('.')[:-2][3]}}"
+      - name: Set decomm host repo file / when host.cluster.product.region.example.com
+        set_fact:
+          host_repo_file: "/data/node/{{ host_product }}/{{ host_region }}/{{ host_cluster }}/{{ host_short }}.yaml"
+      when: device_hostname.split('.')[:-2]|length == 4
+      tags: rm_puppet, full
+
+################# Clone repo ######################
+    - name: set repo path
+      set_fact:
+        git_repo_path: "{{ git_url | urlsplit('path') | regex_replace('.git', '') }}"
+      run_once: true
+
+    - name: git clone
+      git:
+        repo: "{{ git_url }}"
+        dest: "{{ playbook_dir }}{{ git_repo_path }}"
+        update: yes
+        version: "production"
+        force: yes
+      delegate_to: localhost
+      run_once: true
+
+    - name: Check decomm host file in Control
+      stat:
+        path: "{{ playbook_dir }}{{ git_repo_path }}{{ host_repo_file }}"
+      register: repo_file_exists_result
+      delegate_to: localhost
+
+    - name: Set repo file existance
+      set_fact:
+        repo_file_exists: "{{ repo_file_exists_result.stat.exists }}"
+
+    - block:
+
+      - name: git create new branch
+        shell: git checkout -B {{ git_branch }}
+        args:
+          chdir: "{{ playbook_dir }}{{ git_repo_path }}"
+        ignore_errors: true
+################# Make changes ######################
+      - name: Remove decomm hosts files from Control repo
+        file:
+          path: "{{ playbook_dir }}{{ git_repo_path }}{{ host_repo_file }}"
+          state: absent
+################# Push ######################
+      - name: git add all changes
+        shell: git add -A
+        args:
+          chdir: "{{ playbook_dir }}{{ git_repo_path }}"
+        run_once: true
+
+      - name: git status
+        shell: git status
+        args:
+          chdir: "{{ playbook_dir }}{{ git_repo_path }}"
+        register: git_add_status
+        run_once: true
+
+      - name: git username
+        shell: git config user.name "{{ git_username }}"
+        args:
+          chdir: "{{ playbook_dir }}{{ git_repo_path }}"
+        when:
+          - git_username is defined
+          - not "nothing to commit, working tree clean" in git_add_status.stdout
+        run_once: true
+
+      - name: git email
+        shell: git config user.email "{{ git_email }}"
+        args:
+          chdir: "{{ playbook_dir }}{{ git_repo_path }}"
+        when:
+          - git_email is defined
+          - not "nothing to commit, working tree clean" in git_add_status.stdout
+        run_once: true
+
+      - name: git commit
+        shell: git commit -a -m "{{ git_msg }}"
+        args:
+          chdir: "{{ playbook_dir }}{{ git_repo_path }}"
+        register: git_commit_result
+        ignore_errors: true
+        when:
+          - not "nothing to commit, working tree clean" in git_add_status.stdout
+        run_once: true
+
+      - name: git push
+        shell: git push --set-upstream origin {{ git_branch }}
+        args:
+          chdir: "{{ playbook_dir }}{{ git_repo_path }}"
+        register: git_push_result
+        when:
+          - not "nothing to commit, working tree clean" in git_add_status.stdout
+        run_once: true
+
+      - name: delete local repo
+        file:
+          path: "{{ playbook_dir }}{{ git_repo_path }}"
+          state: absent
+        when: git_remove_local
+        run_once: true
+
+#      rescue:
+#       - name: make sure all handlers run
+#         meta: flush_handlers
+      delegate_to: localhost
+      when: repo_file_exists
+
+################# Revoke cert CIV2 ######################
+    - name: Revoke Puppet Cert CIV2 / from puppet0.example.com
+      command: /opt/puppetlabs/bin/puppet cert clean {{ device_hostname }}
+      delegate_to: "{{ puppet_revoke_host_civ2 }}"
+      become: true
+      remote_user: "{{ lookup('env','USERNAME') }}"
+      ignore_errors: true
+      ignore_unreachable: true
+      register: revoke_host_cert_result
+      tags: rm_puppet, full
+
+    - debug:
+        msg:
+          - "{{ git_push_result | d('File not found. Nothing to do.')}}"
+          - "=================================="
+          - "{{ revoke_host_cert_result }}"
+############################################################
+# Part VI. Disable monitoring
+############################################################
+    - name: Disable monitoring / Sensu
+      command: sensu -x -f -c {{ device_hostname }}
+      register: disable_mon_result
+      ignore_errors: true
+      ignore_unreachable: true
+      delegate_to: "{{ sensu_host }}"
+      remote_user: "{{ lookup('env','USERNAME') }}"
+      tags: disable_mon, full
+
+    - debug:
+        msg:
+          - "{{ disable_mon_result }}"
+############################################################
+# Part VII. Infrastructure Cleanup
+############################################################
+    - name: Check device type (physical or virtual) / Device42
+      uri:
+        url: "{{ d42_url }}/devices/name/{{ d42_device_name }}/"
+        method: GET
+        user: "{{ d42_service_user }}"
+        password: "{{ d42_service_user_pwd }}"
+        force_basic_auth: yes
+        return_content: yes
+      delegate_to: localhost
+      register: device_type_result
+      ignore_errors: true
+      when: "'OK' in d42_device_present"
+
+    - name: Set device type, model and tags
+      set_fact:
+        device_type: "{{ device_type_result | json_query('json.type') }}"
+        device_model: "{{ device_type_result | json_query('json.hw_model') }}"
+        device_t: "{{ device_type_result | json_query('json.tags') }}"
+
+    - name: Set device tags
+      set_fact:
+        device_tags: "{{ device_t | join(',') }}"
+
+    - debug:
+        msg:
+          - "{{ device_type}}"
+          - "{{ device_model | regex_search('\\d') }}"
+          - "{{ device_tags }}"
+
+    - block:
+
+      - name: Get host facts / Device42
+        uri:
+          url: "{{ d42_url }}/macs/?device={{ d42_device_name }}"
+          method: GET
+          user: "{{ d42_service_user }}"
+          password: "{{ d42_service_user_pwd }}"
+          force_basic_auth: yes
+          return_content: yes
+        delegate_to: localhost
+        register: d42_host_info_result
+        ignore_errors: true
+
+      - name: Set decomm host facts list
+        set_fact:
+          d42_host_short: "{{ device_hostname | regex_replace('.example.com') }}"
+          d42_host_facts_list: "{{ d42_host_info_result | json_query(query) }}"
+        vars:
+          query: >-
+            json.macaddresses[?port_name!=`ipmi` && port_name!=`IPMI` && port!=`null`].
+            {d42_host_name: device.name,
+             d42_host_mac: macaddress,
+             d42_host_switch: port.switch.name,
+             d42_host_port: port.port}
+
+      - debug:
+          msg:
+            - "{{ d42_host_facts_list }}"
+
+      - name: Get port description from l2 Aristas
+        vars:
+          ansible_connection: network_cli
+          ansible_network_os: eos
+          ansible_network_cli_retries: 1
+          ansible_command_timeout: 10
+          ansible_connect_timeout: 10
+          ansible_connect_retry_timeout: 10
+        cli_command:
+          command: show run int {{ item.d42_host_port }} | incl desc
+        register: sw_port_description
+        delegate_to: "{{ item.d42_host_switch | regex_replace('.example.com') +'.example.com' }}"
+        loop: "{{ d42_host_facts_list }}"
+        ignore_errors: true
+
+      - debug:
+          msg:
+            - "{{ sw_port_description.results }}"
+
+      - name: Set switch ports description list
+        set_fact:
+          sw_port_descr_list: "{{ sw_port_descr_list|default([]) + [ {'sw_port_descr': item.stdout | d('Not accessible') | regex_replace('^description\\s*')} ] }}"
+          sw_access_list: "{{ sw_port_description | json_query('results[*].{sw_not_accessible: failed}') }}"
+        with_items: "{{ sw_port_description.results }}"
+
+      - debug:
+          msg:
+            - "{{ d42_host_facts_list }}"
+            - "{{ sw_port_descr_list }}"
+
+      - name: Make combined facts + descriptions list
+        set_fact:
+          host_facts_list_full: "{{ host_facts_list_full|default([]) + [ item.0 | combine(item.1) | combine(item.2) ] }}"
+        with_together:
+          - "{{ d42_host_facts_list }}"
+          - "{{ sw_port_descr_list }}"
+          - "{{ sw_access_list }}"
+
+      - debug:
+          msg:
+            - "{{ host_facts_list_full }}"
+
+      - name: Shutdown interface(s) on switch(es) / Arista
+        vars:
+          ansible_connection: network_cli
+          ansible_network_os: eos
+          ansible_command_timeout: 60
+        eos_config:
+          parents: "interface {{ item.d42_host_port }}"
+          lines:
+            - "no description"
+#          - "description {{ item.sw_port_descr }}-DECOMM"
+            - "shutdown"
+#            - "sho run int {{ item.d42_host_port }}"
+          save_when: always
+        when:
+          - d42_host_short in item.sw_port_descr
+          - not item.sw_not_accessible
+        register: infrastructure_cleanup_result
+        loop: "{{ host_facts_list_full }}"
+        delegate_to: "{{ item.d42_host_switch | regex_replace('.example.com') +'.example.com' }}"
+        ignore_errors: true
+
+      - name: Get port shutdown result from l2 Aristas
+        vars:
+          ansible_connection: network_cli
+          ansible_network_os: eos
+          ansible_command_timeout: 10
+          ansible_connect_timeout: 10
+        eos_command:
+          commands:
+            - show run int {{ item.d42_host_port }}
+        register: sw_port_result
+        delegate_to: "{{ item.d42_host_switch | regex_replace('.example.com') +'.example.com' }}"
+        loop: "{{ host_facts_list_full }}"
+        ignore_errors: true
+        when: not item.sw_not_accessible
+
+      - name: Set port shutdown result
+        set_fact:
+          sw_port_shutdown: "{{ sw_port_result }}"
+
+      - debug:
+          msg:
+            - "{{ sw_port_shutdown | json_query('results[*].stdout_lines') }}"
+
+      when:
+        - device_type != 'virtual'
+        - "'OK' in d42_device_present"
+############################################################
+# Part VIII. Inventory Cleanup
+############################################################
+    - name: Set service_level and customer
+      set_fact:
+        device_service_level: "{{ 'EOL' if (device_model | regex_search('\\d') == '0') else 'Inventory' }}"
+        device_customer: "{{ 'TRASHCAN' if (device_model | regex_search('\\d') == '0') else 'AVAILABLE' }}"
+        device_needs_remove: "{{ 'true' if (device_model | regex_search('\\d') == '0') else 'false' }}"
+
+    - debug:
+        msg:
+          - "{{ device_service_level }}"
+          - "{{ device_customer }}"
+
+    - name: Change device lifecycle to DECOMMISSIONED / Device42
+      uri:
+        url: "{{ d42_url }}/device/"
+        method: POST
+        body: "name={{ device_hostname }}&service_level={{ device_service_level }}&customer={{ device_customer }}&tags_remove={{ device_tags }}&tags=Decommissioned"
+        user: "{{ d42_service_user }}"
+        password: "{{ d42_service_user_pwd }}"
+        force_basic_auth: yes
+        return_content: yes
+      ignore_errors: yes
+      delegate_to: localhost
+      register: change_lifecycle_result
+      tags: d42_cleanup, full
+      when: "'OK' in d42_device_present"
+
+    - debug:
+        msg:
+          - "{{ change_lifecycle_result }}"
+
+    - name: Decomm complete trigger
+      set_fact:
+        decomm_failed: false
+
+############################################################
+# Report
+############################################################
+  handlers:
+    - name: Play report
+      debug:
+        msg:
+          - "1 Hostname:        {{ device_hostname }}"
+          - "  Device42 name:   {{ d42_device_name if ('OK' in d42_device_present) else 'Device not found in Device42' }}"
+          - "  Host type:       {{ device_type | d('unknown') }}"
+          - "  Shutdown result: {{ shutdown_result }}"
+          - "2 Remove Puppet Config"
+          - "2.1 Revoke cert from {{ puppet_revoke_host_civ1 }}: {{ revoke_pup_cert_result.stdout_lines | d('Connection error')}}"
+          - "2.2 Remove from PuppetDB {{ puppet_adm_host }}: {{ remove_pup_conf_result.stdout_lines | d('Connection error')}}"
+          - "3 Remove DNS records"
+          - "3.1 Resolved IP: {{ resolved_ip | d('Not resolved') }}"
+          - "3.2 Removed A: {{ rm_a_dns_result.url | default(None) | urlsplit('path') | basename }}"
+          - "3.3 Removed PTR: {{ rm_ptr_dns_result.url | default(None) | urlsplit('path') | basename }}"
+          - "4 Reclaim/Remove IP Space"
+          - "4.1 Released IPs: {{ host_release_ips | default('Device not found in Device42') }}"
+          - "5 Puppet Cleanup"
+          - "5.1 Git commit: {{ git_commit_result.stdout_lines | d('File not found in Control repo. Nothing to do.') }}"
+          - "5.2 Git push: {{ git_push_result.stdout_lines | d('File not found in Control repo. Nothing to do.') }}"
+          - "5.3 Revoke cert (CIV2):"
+          - "{{ revoke_host_cert_result.stderr | default('Not revoked') }}"
+          - "{{ revoke_host_cert_result.stdout | default('Not revoked') }}"
+          - "6 Disable monitoring"
+          - "6.1 Disable Sensu: {{ disable_mon_result.stdout | d('Not disabled')}}"
+          - "7 Switch(es) cleanup"
+          - "7.1 Host type: {{ device_type | d('unknown') }}"
+          - "7.2 Switch(es) info: {{ host_facts_list_full | default('Nothing to do') }}"
+          - "7.3 Switch(es) cleanup result:"
+          - "{{ sw_port_shutdown | d('No information') | json_query('results[*].stdout_lines') }}"
+          - "8 Inventory cleanup"
+          - "  Hardware: {{ device_model | default('Device not found in Device42') }}"
+          - "  Service Level: {{ device_service_level | default('Device not found in Device42') }}"
+          - "  Customer: {{ device_customer | default('Device not found in Device42') }}"
+          - "  Result:"
+          - "{{ change_lifecycle_result.content | default('Device not found in Device42') }}"
+          - "========================================"
+          - "Total:"
+          - "Decomm failed: {{ decomm_failed }}"
+          - "Needs Removed: {{ 'Undefined.Decomm failed!' if decomm_failed else device_needs_remove }}"
+          - "PR Required:   {{ 'Undefined.Decomm failed!' if decomm_failed else repo_file_exists }}"
+############################################################
+# Jira comment
+############################################################
+    - name: Comment on issue
+      jira:
+        uri: '{{ jira_url }}'
+        username: '{{ jira_user }}'
+        password: '{{ jira_pass }}'
+        issue: '{{ jira_issue }}'
+        operation: comment
+        comment: |
+          1 Hostname: {{ device_hostname }}
+            Device42 name: {{ d42_device_name if ('OK' in d42_device_present) else 'Device not found in Device42' }}
+            Host type:     {{ device_type | d('unknown') }}
+            Shutdown result: {{ shutdown_result }}
+          2 Remove Puppet Config
+          2.1 Revoke cert from {{ puppet_revoke_host_civ1 }}: {{ revoke_pup_cert_result.stdout_lines | d('Connection error')}}
+          2.2 Remove from PuppetDB {{ puppet_adm_host }}: {{ remove_pup_conf_result.stdout_lines | d('Connection error')}}
+          3 Remove DNS records
+          3.1 Resolved IP: {{ resolved_ip | d('Not resolved') }}
+          3.2 Removed A: {{ rm_a_dns_result.url | default(None) | urlsplit('path') | basename }}
+          3.3 Removed PTR: {{ rm_ptr_dns_result.url | default(None) | urlsplit('path') | basename }}
+          4 Reclaim/Remove IP Space
+          4.1 Released IPs: {{ host_release_ips | default('Device not found in Device42') }}
+          5 Puppet Cleanup
+          5.1 Git commit: {{ git_commit_result.stdout_lines | d('File not found. Nothing to do.') }}
+          5.2 Git push: {{ git_push_result.stdout_lines | d('File not found. Nothing to do.') }}
+          5.3 Revoke cert (CIV2):
+          {{ revoke_host_cert_result.stderr | default('Not revoked') }}
+          {{ revoke_host_cert_result.stdout | default('Not revoked') }}
+          6 Disable monitoring
+          6.1 Disable Sensu: {{ disable_mon_result.stdout | d('Not disabled')}}
+          7 Switch(es) cleanup
+          7.1 Host type: {{ device_type | d('unknown') }}
+          7.2 Switch(es) info: {{ host_facts_list_full | default('Nothing to do') }}
+          7.3 Switch(es) cleanup result:
+          {{ sw_port_shutdown | d('No information') | json_query('results[*].stdout_lines') }}
+          8 Inventory cleanup
+            Hardware: {{ device_model | default('Device not found in Device42') }}
+            Service Level: {{ device_service_level | default('Device not found in Device42') }}
+            Customer: {{ device_customer | default('Device not found in Device42') }}
+            Result: {{ change_lifecycle_result.content | default('Device not found in Device42') }}
+          ========================================
+          Total:
+            Decomm failed: {{ decomm_failed }}
+            Needs Removed: {{ 'Undefined.Decomm failed!' if decomm_failed else device_needs_remove }}
+            PR Required:   {{ 'Undefined.Decomm failed!' if decomm_failed else repo_file_exists }}
+      delegate_to: localhost
+      when:
+        - jira_add
+        - jira_issue is defined
+      listen: "Jira report"
+
+    - name: Decomm Failed issue status
+      jira:
+        uri: '{{ jira_url }}'
+        username: '{{ jira_user }}'
+        password: '{{ jira_pass }}'
+        issue: '{{ jira_issue }}'
+        operation: transition
+        status: Decomm Failed
+      ignore_errors: true
+      delegate_to: localhost
+      when:
+        - decomm_failed
+        - jira_add
+        - jira_issue is defined
+      listen: "Jira report"
+
+#    - name: Needs Removed issue status
+#      jira:
+#        uri: '{{ jira_url }}'
+#        username: '{{ jira_user }}'
+#        password: '{{ jira_pass }}'
+#        issue: '{{ jira_issue }}'
+#        operation: transition
+#        status: Needs Removed
+#      ignore_errors: true
+#      delegate_to: localhost
+#      when:
+#        - device_needs_remove
+#        - not repo_file_exists
+#        - jira_add
+#        - jira_issue is defined
+#      listen: "Jira report"
+
+#    - name: PR Required issue status
+#      jira:
+#        uri: '{{ jira_url }}'
+#        username: '{{ jira_user }}'
+#        password: '{{ jira_pass }}'
+#        issue: '{{ jira_issue }}'
+#        operation: transition
+#        status: PR Required
+#      ignore_errors: true
+#      delegate_to: localhost
+#      when:
+#        - repo_file_exists
+#        - "'Permission denied' not in shutdown_result"
+#        - jira_add
+#        - jira_issue is defined
+#      listen: "Jira report"
+
+    - name: Action Required issue status
+      jira:
+        uri: '{{ jira_url }}'
+        username: '{{ jira_user }}'
+        password: '{{ jira_pass }}'
+        issue: '{{ jira_issue }}'
+        operation: transition
+        status: Action Required
+      ignore_errors: true
+      delegate_to: localhost
+      when:
+        - "'Permission denied' in shutdown_result" or
+          device_needs_remove or
+          repo_file_exists
+        - jira_add
+        - jira_issue is defined
+      listen: "Jira report"
+
+    - name: Close the issue
+      jira:
+        uri: '{{ jira_url }}'
+        username: '{{ jira_user }}'
+        password: '{{ jira_pass }}'
+        issue: '{{ jira_issue }}'
+        operation: transition
+        status: Decomm Complete
+      args:
+        fields:
+          resolution:
+            self: "https://bugs.example.com/rest/api/2/resolution/10000"
+            id: "10000"
+            description: ""
+            name: "Done"
+      ignore_errors: true
+      delegate_to: localhost
+      when:
+        - not decomm_failed
+        - not device_needs_remove
+        - not repo_file_exists
+        - "'Permission denied' not in shutdown_result"
+        - jira_add
+        - jira_issue is defined
+      listen: "Jira report"
