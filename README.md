@@ -1,6 +1,7 @@
 # Server Decommission with Ansible and Jira
 
 Based on Jira ticket with special status.
+Note. As a result, the technical staff should know from the Jira ticket comment which steps were successful or not, whether it is necessary to do a PR with Puppet configuration changes.
 
 Ansible workflow:
 
@@ -48,5 +49,3 @@ Ansible workflow:
 
 11. Jira comment
     * Create report as handler in Jira ticket
-
-Note. As a result, the technical staff should know from the Jira ticket comment which steps were successful or not, whether it is necessary to do a PR with Puppet configuration changes.
